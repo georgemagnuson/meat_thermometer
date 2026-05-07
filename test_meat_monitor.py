@@ -541,39 +541,48 @@ bluetooth = pytest.mark.skipif(
     reason="bleak not installed — BLE tests require the Pi",
 )
 
-SCAN_TIMEOUT    = 10.0  # seconds to scan for the device
+SCAN_TIMEOUT    = 15.0  # seconds to scan for the device
 CONNECT_TIMEOUT = 15.0  # seconds to wait for a BLE connection
 READING_TIMEOUT = 10.0  # seconds to wait for the first temperature notification
+BLE_SETTLE_SECS =  2.0  # wait between scan and connect so the BLE stack is free
+
+
+@pytest.fixture(scope="module")
+async def emax_scan():
+    """Scan once for the EMAX and share results across all scan-dependent tests.
+    Skips the entire module if the device is not found."""
+    if not _BLEAK_AVAILABLE:
+        pytest.skip("bleak not installed")
+    devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
+    target = EMAX_ADDRESS.upper()
+    match = next((v for k, v in devices.items() if k.upper() == target), None)
+    if match is None:
+        pytest.skip(f"EMAX {EMAX_ADDRESS} not found in scan — is it powered on?")
+    return match  # (BLEDevice, AdvertisementData)
 
 
 @bluetooth
 @pytest.mark.bluetooth
 class TestEMAXBluetooth:
-    async def test_emax_is_discoverable(self):
+    async def test_emax_is_discoverable(self, emax_scan):
         """EMAX appears in a BLE scan by its known address."""
-        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
-        addresses = [addr.upper() for addr in devices]
-        if EMAX_ADDRESS.upper() not in addresses:
-            pytest.skip(f"EMAX {EMAX_ADDRESS} not found in scan — is it powered on?")
-        assert EMAX_ADDRESS.upper() in addresses
+        device, _ = emax_scan
+        assert device.address.upper() == EMAX_ADDRESS.upper()
 
-    async def test_emax_advertises_expected_service(self):
+    async def test_emax_advertises_expected_service(self, emax_scan):
         """EMAX advertisement includes the ffb0 vendor service UUID."""
-        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
-        if EMAX_ADDRESS.upper() not in [a.upper() for a in devices]:
-            pytest.skip(f"EMAX {EMAX_ADDRESS} not found in scan — is it powered on?")
-
-        _, adv = devices[EMAX_ADDRESS.upper()]
+        _, adv = emax_scan
         service_uuids = [str(u).lower() for u in adv.service_uuids]
         assert "0000ffb0-0000-1000-8000-00805f9b34fb" in service_uuids
 
-    async def test_emax_connects(self):
+    async def test_emax_connects(self, emax_scan):
         """BleakClient connects to the EMAX without error."""
+        await asyncio.sleep(BLE_SETTLE_SECS)  # let BLE stack settle after scan
         try:
             async with BleakClient(EMAX_ADDRESS, timeout=CONNECT_TIMEOUT) as client:
                 assert client.is_connected
         except Exception as e:
-            pytest.skip(f"Could not connect to EMAX: {e}")
+            pytest.fail(f"Could not connect to EMAX: {e}")
 
     async def test_emax_has_expected_characteristics(self):
         """Connected EMAX exposes ffb1 (write+notify) and ffb2 (notify) characteristics."""
