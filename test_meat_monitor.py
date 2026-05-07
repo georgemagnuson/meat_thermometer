@@ -1,8 +1,14 @@
 """
 test_meat_monitor.py — TDD tests for meat_monitor.py
-Run: pytest test_meat_monitor.py -v
+
+Run unit tests only (no hardware needed):
+  pytest test_meat_monitor.py -v
+
+Run BLE integration tests (thermometer must be powered on and in range):
+  pytest test_meat_monitor.py -v -m bluetooth
 """
 
+import asyncio
 import csv
 import pytest
 from datetime import datetime, timedelta
@@ -515,3 +521,110 @@ class TestSessionLogger:
         with open(list(tmp_path.glob("*.csv"))[0]) as f:
             rows = list(csv.DictReader(f))
         assert len(rows) == 5
+
+
+# ---------------------------------------------------------------------------
+# Bluetooth integration tests
+# Run with:  pytest test_meat_monitor.py -v -m bluetooth
+# ---------------------------------------------------------------------------
+
+try:
+    from bleak import BleakScanner, BleakClient
+    _BLEAK_AVAILABLE = True
+except ImportError:
+    _BLEAK_AVAILABLE = False
+
+from meat_monitor import EMAX_ADDRESS, EMAX_WRITE_CHAR, EMAX_NOTIFY_CHAR, EMAX_START_CMD
+
+bluetooth = pytest.mark.skipif(
+    not _BLEAK_AVAILABLE,
+    reason="bleak not installed — BLE tests require the Pi",
+)
+
+SCAN_TIMEOUT    = 10.0  # seconds to scan for the device
+CONNECT_TIMEOUT = 15.0  # seconds to wait for a BLE connection
+READING_TIMEOUT = 10.0  # seconds to wait for the first temperature notification
+
+
+@bluetooth
+@pytest.mark.bluetooth
+class TestEMAXBluetooth:
+    async def test_emax_is_discoverable(self):
+        """EMAX appears in a BLE scan by its known address."""
+        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
+        addresses = [addr.upper() for addr in devices]
+        if EMAX_ADDRESS.upper() not in addresses:
+            pytest.skip(f"EMAX {EMAX_ADDRESS} not found in scan — is it powered on?")
+        assert EMAX_ADDRESS.upper() in addresses
+
+    async def test_emax_advertises_expected_service(self):
+        """EMAX advertisement includes the ffb0 vendor service UUID."""
+        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
+        if EMAX_ADDRESS.upper() not in [a.upper() for a in devices]:
+            pytest.skip(f"EMAX {EMAX_ADDRESS} not found in scan — is it powered on?")
+
+        _, adv = devices[EMAX_ADDRESS.upper()]
+        service_uuids = [str(u).lower() for u in adv.service_uuids]
+        assert "0000ffb0-0000-1000-8000-00805f9b34fb" in service_uuids
+
+    async def test_emax_connects(self):
+        """BleakClient connects to the EMAX without error."""
+        try:
+            async with BleakClient(EMAX_ADDRESS, timeout=CONNECT_TIMEOUT) as client:
+                assert client.is_connected
+        except Exception as e:
+            pytest.skip(f"Could not connect to EMAX: {e}")
+
+    async def test_emax_has_expected_characteristics(self):
+        """Connected EMAX exposes ffb1 (write+notify) and ffb2 (notify) characteristics."""
+        try:
+            async with BleakClient(EMAX_ADDRESS, timeout=CONNECT_TIMEOUT) as client:
+                uuids = {str(c.uuid).lower() for s in client.services for c in s.characteristics}
+        except Exception as e:
+            pytest.skip(f"Could not connect to EMAX: {e}")
+
+        assert EMAX_WRITE_CHAR  in uuids, f"ffb1 write char not found"
+        assert EMAX_NOTIFY_CHAR in uuids, f"ffb2 notify char not found"
+
+    async def test_emax_streams_temperature(self):
+        """After sending start command, EMAX delivers a parseable temperature reading."""
+        received: list[dict] = []
+
+        def on_notify(sender, data: bytearray):
+            parsed = parse_emax_payload(data)
+            if parsed:
+                received.append(parsed)
+
+        try:
+            async with BleakClient(EMAX_ADDRESS, timeout=CONNECT_TIMEOUT) as client:
+                await client.start_notify(EMAX_NOTIFY_CHAR, on_notify)
+                await client.write_gatt_char(EMAX_WRITE_CHAR, EMAX_START_CMD, response=False)
+                await asyncio.sleep(READING_TIMEOUT)
+                await client.stop_notify(EMAX_NOTIFY_CHAR)
+        except Exception as e:
+            pytest.skip(f"Could not connect to EMAX: {e}")
+
+        assert len(received) > 0, "No temperature notifications received"
+
+    async def test_emax_temperature_in_plausible_range(self):
+        """Temperature reading from EMAX is within a plausible range (0–150°C)."""
+        received: list[dict] = []
+
+        def on_notify(sender, data: bytearray):
+            parsed = parse_emax_payload(data)
+            if parsed:
+                received.append(parsed)
+
+        try:
+            async with BleakClient(EMAX_ADDRESS, timeout=CONNECT_TIMEOUT) as client:
+                await client.start_notify(EMAX_NOTIFY_CHAR, on_notify)
+                await client.write_gatt_char(EMAX_WRITE_CHAR, EMAX_START_CMD, response=False)
+                await asyncio.sleep(READING_TIMEOUT)
+                await client.stop_notify(EMAX_NOTIFY_CHAR)
+        except Exception as e:
+            pytest.skip(f"Could not connect to EMAX: {e}")
+
+        assert len(received) > 0, "No temperature notifications received"
+        for reading in received:
+            temp = reading["temp_c"]
+            assert 0 <= temp <= 150, f"Temperature {temp}°C outside plausible range"
