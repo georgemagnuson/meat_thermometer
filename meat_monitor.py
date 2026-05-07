@@ -17,7 +17,6 @@ Commands (type + Enter while running):
 
 import asyncio
 import csv
-import signal
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -371,18 +370,25 @@ class EMAXReader:
 
     async def stream(self, on_reading: Callable[[int], None]) -> None:
         print(f"Connecting to EMAX Smart {self._address} ...")
-        async with BleakClient(self._address) as client:
-            print(f"Connected.\n")
+        try:
+            async with BleakClient(self._address, timeout=15.0) as client:
+                print(f"Connected.\n")
 
-            def on_notify(sender, data: bytearray):
-                parsed = parse_emax_payload(data)
-                if parsed:
-                    on_reading(parsed["temp_c"])
+                def on_notify(sender, data: bytearray):
+                    parsed = parse_emax_payload(data)
+                    if parsed:
+                        on_reading(parsed["temp_c"])
 
-            await client.start_notify(EMAX_NOTIFY_CHAR, on_notify)
-            await client.write_gatt_char(EMAX_WRITE_CHAR, EMAX_START_CMD, response=False)
-            await self._stop.wait()
-            await client.stop_notify(EMAX_NOTIFY_CHAR)
+                await client.start_notify(EMAX_NOTIFY_CHAR, on_notify)
+                await client.write_gatt_char(EMAX_WRITE_CHAR, EMAX_START_CMD, response=False)
+                await self._stop.wait()
+                await client.stop_notify(EMAX_NOTIFY_CHAR)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"\n  BLE error: {e}")
+            print(f"  Is the thermometer powered on and in range?")
+            self._stop.set()
 
 # ---------------------------------------------------------------------------
 # Display helpers
@@ -448,6 +454,7 @@ async def main() -> None:
     # Keyboard input in a background thread
     loop = asyncio.get_running_loop()
     cmd_queue: asyncio.Queue[str] = asyncio.Queue()
+    _stop_event = asyncio.Event()
 
     def read_stdin():
         while True:
@@ -466,7 +473,10 @@ async def main() -> None:
     async def run_loop():
         nonlocal session_start
         while True:
-            await asyncio.sleep(2)
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                return
 
             # Process keyboard commands
             while not cmd_queue.empty():
@@ -521,11 +531,21 @@ async def main() -> None:
 
     try:
         await run_loop()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
+        reader.stop()
         ble_task.cancel()
+        try:
+            await asyncio.wait_for(ble_task, timeout=3.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
         logger.close()
         print_banner(f"Session ended — log saved to {logger.path}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
